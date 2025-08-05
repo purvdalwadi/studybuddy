@@ -1,0 +1,1248 @@
+const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
+const User = require('../models/User');
+const Token = require('../models/Token');
+const { AppError } = require('../middleware/errorHandler');
+const asyncHandler = require('../middleware/async');
+const sendEmail = require('../utils/sendEmail');
+const logger = require('../utils/logger');
+const rateLimit = require('express-rate-limit');
+const { performance } = require('perf_hooks');
+
+// Token expiration times (in seconds)
+const TOKEN_EXPIRES_IN = process.env.JWT_EXPIRES_IN || 24 * 60 * 60; // 24 hours
+const REFRESH_TOKEN_EXPIRES_IN = process.env.REFRESH_TOKEN_EXPIRES_IN || 7 * 24 * 60 * 60; // 7 days
+
+// Cookie options
+const cookieOptions = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: 'strict',
+  maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+  path: '/',
+  domain: process.env.COOKIE_DOMAIN || undefined
+};
+
+// Generate JWT token
+const signToken = (id, expiresIn = TOKEN_EXPIRES_IN) => {
+  return jwt.sign(
+    { id },
+    process.env.JWT_SECRET,
+    { expiresIn }
+  );
+};
+
+// Generate refresh token
+const generateRefreshToken = async (userId, req) => {
+  const refreshToken = crypto.randomBytes(40).toString('hex');
+  
+  // Save refresh token to database
+  await Token.saveToken({
+    token: refreshToken,
+    userId,
+    type: 'refresh',
+    expiresAt: new Date(Date.now() + REFRESH_TOKEN_EXPIRES_IN * 1000),
+    ipAddress: req.ip || req.connection.remoteAddress,
+    userAgent: req.headers['user-agent']
+  });
+  
+  return refreshToken;
+};
+
+/**
+ * Map to store active user sessions
+ * Key: sessionId (string)
+ * Value: {
+ *   userId: ObjectId,
+ *   ip: string,
+ *   userAgent: string,
+ *   lastActivity: number (timestamp),
+ *   expiresAt: number (timestamp)
+ * }
+ */
+const activeSessions = new Map();
+
+/**
+ * Helper function to log request details
+ * @param {Object} req - Express request object
+ * @param {number} startTime - Performance timestamp when the request started
+ */
+const logRequest = (req, startTime) => {
+  const duration = performance.now() - startTime;
+  const { method, originalUrl, ip } = req;
+  const userAgent = req.get('user-agent') || 'unknown';
+  
+  logger.http(`${req.method} ${req.originalUrl} - ${duration.toFixed(2)}ms`, {
+    method: req.method,
+    url: req.originalUrl,
+    ip: req.ip,
+    userAgent: req.get('user-agent'),
+    duration: `${duration.toFixed(2)}ms`,
+    timestamp: new Date().toISOString()
+  });
+};
+
+// Rate limiting for login attempts to prevent brute force attacks
+exports.loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // limit each IP to 5 login attempts per windowMs
+  message: {
+    status: 'error',
+    message: 'Too many login attempts from this IP, please try again later'
+  },
+  skipSuccessfulRequests: true, // Don't count successful requests
+  skip: (req) => {
+    // Skip rate limiting for health checks and other non-sensitive endpoints
+    return req.path.includes('health') || req.method === 'GET';
+  },
+  handler: (req, res) => {
+    logger.warn(`Rate limit exceeded for IP: ${req.ip} on path: ${req.path}`);
+    res.status(429).json({
+      status: 'error',
+      message: 'Too many login attempts, please try again later'
+    });
+  }
+});
+
+// Track active sessions is now defined at the top of the file
+// Helper function to log request details is now defined at the top of the file
+
+// @desc    Register user
+// @route   POST /api/v1/auth/register
+// @access  Public
+exports.register = asyncHandler(async (req, res, next) => {
+  const startTime = performance.now();
+  const { name, email, password, university, major, year, bio } = req.body;
+  const ip = req.ip || req.connection.remoteAddress;
+  const userAgent = req.get('user-agent') || 'unknown';
+
+  try {
+    // Log registration attempt
+    logger.info('Registration attempt', { 
+      email: email?.substring(0, 3) + '...@...' + email?.split('@')[1]?.substring(0, 3),
+      ip,
+      userAgent 
+    });
+
+    // Check if user already exists (case-insensitive email check)
+    const existingUser = await User.findOne({ email: { $regex: new RegExp(`^${email}$`, 'i') } });
+    
+    if (existingUser) {
+      logger.warn('Registration attempt with existing email', { 
+        email: email?.substring(0, 3) + '...@...' + email?.split('@')[1]?.substring(0, 3),
+        ip,
+        userAgent 
+      });
+      return next(new AppError('A user with this email already exists. Please use a different email or login.', 409));
+    }
+
+    // Additional security: Check if IP has made too many registration attempts
+    const registrationAttempts = await User.countDocuments({ 
+      registrationIp: ip,
+      createdAt: { $gt: new Date(Date.now() - 24 * 60 * 60 * 1000) } // Last 24 hours
+    });
+
+    if (registrationAttempts > 5) {
+      logger.warn('Too many registration attempts from IP', { ip, count: registrationAttempts });
+      return next(new AppError('Too many registration attempts. Please try again later.', 429));
+    }
+
+    // Create user with additional security fields
+    const user = await User.create({
+      name: name.trim(),
+      email: email.toLowerCase().trim(),
+      password,
+      university: university ? university.trim() : '',
+      major: major ? major.trim() : '',
+      year: year || 'Other',
+      bio: bio ? bio.trim() : '',
+      registrationIp: ip,
+      lastLoginIp: ip,
+      userAgent,
+      isVerified: false, // Email verification will be implemented separately
+      failedLoginAttempts: 0,
+      lastLogin: new Date()
+    });
+
+    // Generate email verification token
+    const verificationToken = user.getEmailVerificationToken();
+    await user.save({ validateBeforeSave: false });
+
+    // Log successful registration
+    logger.info('New user registered successfully', { 
+      userId: user._id,
+      email: user.email.substring(0, 3) + '...@...' + user.email.split('@')[1]?.substring(0, 3)
+    });
+
+    // Prepare user data for response (exclude sensitive fields)
+    const userData = {
+      _id: user._id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      isVerified: user.isVerified,
+      university: user.university,
+      major: user.major,
+      year: user.year,
+      bio: user.bio,
+      createdAt: user.createdAt
+    };
+
+    // Send welcome email with verification link (in background)
+    try {
+      await sendWelcomeEmail(user, verificationToken);
+    } catch (emailError) {
+      logger.error('Failed to send welcome email', { 
+        userId: user._id,
+        error: emailError.message 
+      });
+      // Continue even if email fails
+    }
+
+    // Log successful response
+    logRequest(req, startTime);
+    
+    // Send response with token and user data
+    sendTokenResponse(user, 201, res, userData);
+  } catch (error) {
+    // Log detailed error information
+    logger.error('Registration error', { 
+      error: error.message,
+      stack: error.stack,
+      email: email?.substring(0, 3) + '...@...' + email?.split('@')[1]?.substring(0, 3),
+      ip,
+      userAgent 
+    });
+    
+    // Handle specific MongoDB errors
+    if (error.name === 'ValidationError') {
+      const errors = Object.values(error.errors).map(err => ({
+        field: err.path,
+        message: err.message
+      }));
+      return next(new AppError('Validation failed', 400, { errors }));
+    }
+    
+    // Handle duplicate key errors (unique constraint violations)
+    if (error.code === 11000) {
+      return next(new AppError('A user with this email already exists', 409));
+    }
+    
+    next(error);
+  }
+});
+
+// @desc    Login user
+// @route   POST /api/v1/auth/login
+// @access  Public
+exports.login = asyncHandler(async (req, res, next) => {
+  const startTime = performance.now();
+  const { email, password } = req.body;
+  const ip = req.ip || req.connection.remoteAddress;
+  const userAgent = req.get('user-agent') || 'unknown';
+  const forwardedFor = req.get('x-forwarded-for');
+  const isRateLimited = req.rateLimit?.remaining === 0;
+
+  try {
+    // Log login attempt
+    logger.info('Login attempt', { 
+      email: email?.substring(0, 3) + '...@...' + email?.split('@')[1]?.substring(0, 3),
+      ip,
+      userAgent,
+      isRateLimited
+    });
+
+    // Check if rate limited
+    if (isRateLimited) {
+      logger.warn('Rate limited login attempt', { email: email?.substring(0, 3) + '...', ip });
+      return next(new AppError('Too many login attempts. Please try again later.', 429));
+    }
+
+    // Validate input
+    if (!email || !password) {
+      return next(new AppError('Please provide both email and password', 400));
+    }
+
+    // Find user by email (case-insensitive) and include password
+    const user = await User.findOne({ 
+      email: { $regex: new RegExp(`^${email}$`, 'i') } 
+    }).select('+password +failedLoginAttempts +isLocked +lockUntil');
+
+    // Check if account is locked
+    if (user?.isLocked && user.lockUntil > Date.now()) {
+      const minutesLeft = Math.ceil((user.lockUntil - Date.now()) / (1000 * 60));
+      logger.warn('Login attempt to locked account', { 
+        userId: user._id,
+        email: user.email.substring(0, 3) + '...',
+        ip,
+        minutesLeft 
+      });
+      return next(new AppError(`Account is temporarily locked. Please try again in ${minutesLeft} minutes.`, 423));
+    }
+
+    // Check if user exists and password is correct
+    if (!user || !(await user.matchPassword(password))) {
+      // Track failed login attempt
+      const now = Date.now();
+      const loginWindow = 15 * 60 * 1000; // 15 minutes in milliseconds
+      const maxAttempts = 5;
+      
+      if (user) {
+        // Reset failed attempts if window has passed
+        if (user.lastFailedLogin && (now - user.lastFailedLogin.getTime()) > loginWindow) {
+          user.failedLoginAttempts = 1;
+        } else {
+          user.failedLoginAttempts = (user.failedLoginAttempts || 0) + 1;
+        }
+        
+        // Update last failed login timestamp
+        user.lastFailedLogin = now;
+        
+        // Check if account should be locked
+        if (user.failedLoginAttempts >= maxAttempts) {
+          user.isLocked = true;
+          user.lockUntil = new Date(now + 15 * 60 * 1000); // Lock for 15 minutes
+          
+          logger.warn('Account locked due to too many failed attempts', { 
+            userId: user._id,
+            email: user.email.substring(0, 3) + '...',
+            ip,
+            attempts: user.failedLoginAttempts,
+            lockUntil: user.lockUntil,
+            userAgent: userAgent.substring(0, 50) + '...'
+          });
+          
+          // Notify user via email about the lockout (in background)
+          notifyAccountLocked(user, ip).catch(err => {
+            logger.error('Failed to send account locked notification', {
+              userId: user._id,
+              error: err.message
+            });
+          });
+          
+          // Save the updated user document
+          await user.save({ validateBeforeSave: false });
+        }
+      }
+      
+      if (!isPasswordValid) {
+      const remainingAttempts = user ? maxAttempts - user.failedLoginAttempts : maxAttempts;
+      const message = user && user.failedLoginAttempts >= maxAttempts - 2 ? 
+        `Account will be locked after ${maxAttempts - user.failedLoginAttempts} more failed attempt(s).` : 
+        'Incorrect email or password';
+        
+      logger.warn('Failed login attempt - Invalid password', {
+        email: user.email.substring(0, 3) + '...',
+        ip,
+        userAgent: userAgent.substring(0, 50) + '...',
+        userId: user._id,
+        remainingAttempts: Math.max(0, remainingAttempts),
+        isLocked: user.isLocked
+      });
+      
+      return next(new AppError({
+        message,
+        statusCode: 401,
+        code: 'AUTH_FAILED',
+        remainingAttempts: Math.max(0, remainingAttempts),
+        isLocked: user.isLocked,
+        lockUntil: user.lockUntil
+      }));
+    }
+
+    // Check if account is verified (if verification is required)
+    if (process.env.REQUIRE_EMAIL_VERIFICATION === 'true' && !user.isVerified) {
+      logger.warn('Login attempt with unverified email', { 
+        userId: user._id,
+        email: user.email.substring(0, 3) + '...'
+      });
+      return next(new AppError('Please verify your email address before logging in', 403));
+    }
+
+    // Reset failed login attempts on successful login
+    user.failedLoginAttempts = 0;
+    user.isLocked = false;
+    user.lockUntil = undefined;
+    user.lastLogin = new Date();
+    user.lastLoginIp = ip;
+    user.userAgent = userAgent;
+    
+    if (forwardedFor) {
+      user.lastLoginLocation = forwardedFor.split(',')[0].trim();
+    }
+    
+    await user.save({ validateBeforeSave: false });
+
+    // Log successful login
+    logger.info('User logged in successfully', { 
+      userId: user._id,
+      email: user.email.substring(0, 3) + '...',
+      ip,
+      userAgent: userAgent.substring(0, 50) + '...'
+    });
+
+    // Track active session
+    const sessionId = crypto.randomBytes(16).toString('hex');
+    activeSessions.set(sessionId, {
+      userId: user._id,
+      ip,
+      userAgent,
+      lastActivity: Date.now(),
+      expiresAt: Date.now() + (parseInt(process.env.JWT_COOKIE_EXPIRE) * 24 * 60 * 60 * 1000 || 30 * 24 * 60 * 60 * 1000)
+    });
+
+    // Prepare user data for response
+    const userData = {
+      _id: user._id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      isVerified: user.isVerified,
+      university: user.university,
+      major: user.major,
+      year: user.year,
+      bio: user.bio,
+      lastLogin: user.lastLogin
+    };
+
+    // Log successful response
+    logRequest(req, startTime);
+    
+    // Send response with token and user data
+    sendTokenResponse(user, 200, res, userData, sessionId);
+  } catch (error) {
+    // Enhanced error logging
+    const errorDetails = {
+      name: error.name,
+      message: error.message,
+      code: error.code,
+      keyValue: error.keyValue,
+      stack: error.stack,
+      email: email?.substring(0, 3) + '...',
+      ip,
+      userAgent: userAgent?.substring(0, 50) + '...'
+    };
+    
+    logger.error('Login error', errorDetails);
+    
+    // Handle specific errors
+    if (error.name === 'ValidationError') {
+      const errors = Object.values(error.errors).map(err => ({
+        field: err.path,
+        message: err.message
+      }));
+      return next(new AppError('Validation failed', 400, { errors }));
+    }
+    
+    // Handle MongoDB duplicate key errors
+    if (error.code === 11000) {
+      const field = Object.keys(error.keyValue)[0];
+      return next(new AppError(`${field} already exists`, 400));
+    }
+    
+    // Handle JWT errors
+    if (error.name === 'JsonWebTokenError') {
+      return next(new AppError('Invalid token', 401));
+    }
+    
+    if (error.name === 'TokenExpiredError') {
+      return next(new AppError('Token expired', 401));
+    }
+    
+    // For all other errors, send a generic error message
+    next(new AppError('An error occurred during login', 500, {
+      error: error.toString(),
+      name: error.name,
+      message: error.message
+    }));
+  }
+});
+
+// @desc    Get current logged in user
+// @route   GET /api/v1/auth/me
+// @access  Private
+exports.getMe = asyncHandler(async (req, res, next) => {
+  const startTime = performance.now();
+  const userId = req.user.id;
+  const ip = req.ip || req.connection.remoteAddress;
+  const userAgent = req.get('user-agent') || 'unknown';
+
+  try {
+    logger.debug('Fetching user profile', { userId, ip });
+    
+    // Find user and select only necessary fields
+    const user = await User.findById(userId).select(
+      'name email role isVerified university major year bio lastLogin createdAt'
+    );
+
+    if (!user) {
+      logger.warn('User not found', { userId, ip });
+      return next(new AppError('User not found', 404));
+    }
+
+    // Add last active timestamp
+    const lastActive = new Date();
+    
+    // Log successful profile fetch
+    logger.info('User profile fetched successfully', { 
+      userId,
+      email: user.email.substring(0, 3) + '...',
+      ip,
+      userAgent: userAgent.substring(0, 50) + '...'
+    });
+
+    // Log successful response
+    logRequest(req, startTime);
+
+    res.status(200).json({
+      status: 'success',
+      data: {
+        user: {
+          _id: user._id,
+          name: user.name,
+          email: user.email,
+          role: user.role,
+          isVerified: user.isVerified,
+          university: user.university,
+          major: user.major,
+          year: user.year,
+          bio: user.bio,
+          lastLogin: user.lastLogin,
+          createdAt: user.createdAt,
+          lastActive: lastActive.toISOString()
+        }
+      }
+    });
+  } catch (error) {
+    logger.error('Error fetching user profile', { 
+      error: error.message,
+      stack: error.stack,
+      userId,
+      ip,
+      userAgent
+    });
+    
+    next(new AppError('Error fetching user profile', 500));
+  }
+});
+
+// @desc    Update user details
+// @route   PUT /api/auth/updatedetails
+// @access  Private
+exports.updateDetails = asyncHandler(async (req, res, next) => {
+  try {
+    // Filter out unwanted fields that should not be updated
+    const { name, email, university, major, year, bio } = req.body;
+    const fieldsToUpdate = {};
+    
+    if (name) fieldsToUpdate.name = name;
+    if (email) fieldsToUpdate.email = email.toLowerCase();
+    if (university) fieldsToUpdate.university = university;
+    if (major) fieldsToUpdate.major = major;
+    if (year) fieldsToUpdate.year = year;
+    if (bio) fieldsToUpdate.bio = bio;
+
+    // Check if email is being updated and if it's already taken
+    if (email && email !== req.user.email) {
+      const existingUser = await User.findOne({ email: email.toLowerCase() });
+      if (existingUser) {
+        return next(new AppError('Email is already in use', 400));
+      }
+    }
+
+    const user = await User.findByIdAndUpdate(
+      req.user.id,
+      fieldsToUpdate,
+      {
+        new: true,
+        runValidators: true,
+        select: '-__v -password -resetPasswordToken -resetPasswordExpire'
+      }
+    );
+
+    if (!user) {
+      return next(new AppError('User not found', 404));
+    }
+
+    logger.info(`User details updated: ${user._id}`);
+
+    res.status(200).json({
+      status: 'success',
+      data: user,
+    });
+  } catch (error) {
+    logger.error('Error updating user details:', error);
+    next(error);
+  }
+});
+
+// @desc    Update password
+// @route   PUT /api/auth/updatepassword
+// @access  Private
+exports.updatePassword = asyncHandler(async (req, res, next) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+
+    if (!currentPassword || !newPassword) {
+      return next(new AppError('Please provide both current and new password', 400));
+    }
+
+    if (currentPassword === newPassword) {
+      return next(new AppError('New password must be different from current password', 400));
+    }
+
+    const user = await User.findById(req.user.id).select('+password');
+
+    // Check current password
+    if (!(await user.matchPassword(currentPassword))) {
+      logger.warn(`Incorrect current password attempt for user: ${user._id}`);
+      return next(new AppError('Current password is incorrect', 401));
+    }
+
+    // Update password
+    user.password = newPassword;
+    user.passwordChangedAt = Date.now() - 1000; // Ensure token is still valid
+    await user.save();
+
+    logger.info(`Password updated for user: ${user._id}`);
+
+    // Send new token
+    sendTokenResponse(user, 200, res);
+  } catch (error) {
+    logger.error('Error updating password:', error);
+    next(error);
+  }
+});
+
+// @desc    Forgot password
+// @route   POST /api/auth/forgotpassword
+// @access  Public
+exports.forgotPassword = asyncHandler(async (req, res, next) => {
+  try {
+    const { email } = req.body;
+    
+    if (!email) {
+      return next(new AppError('Please provide an email address', 400));
+    }
+
+    const user = await User.findOne({ email: email.toLowerCase() });
+
+    if (!user) {
+      // Don't reveal if user exists or not
+      logger.warn(`Password reset requested for non-existent email: ${email}`);
+      return res.status(200).json({
+        status: 'success',
+        message: 'If an account with that email exists, a reset link has been sent',
+      });
+    }
+
+
+    // Generate and save reset token
+    const resetToken = user.getResetPasswordToken();
+    await user.save({ validateBeforeSave: false });
+
+    // Create reset URL
+    const resetUrl = `${req.protocol}://${req.get(
+      'host'
+    )}/api/v1/auth/resetpassword/${resetToken}`;
+
+    const message = `You are receiving this email because you (or someone else) has requested the reset of a password for your account.\n\nPlease make a PUT request to: \n\n ${resetUrl}\n\nThis link will expire in 10 minutes.`;
+
+    try {
+      await sendEmail({
+        email: user.email,
+        subject: 'Your password reset token (valid for 10 min)',
+        message,
+      });
+
+      logger.info(`Password reset email sent to: ${user.email}`);
+
+      res.status(200).json({
+        status: 'success',
+        message: 'If an account with that email exists, a reset link has been sent',
+      });
+    } catch (err) {
+      logger.error('Error sending password reset email:', err);
+      
+      // Reset the token if email fails
+      user.resetPasswordToken = undefined;
+      user.resetPasswordExpire = undefined;
+      await user.save({ validateBeforeSave: false });
+
+      return next(
+        new AppError('There was an error sending the email. Please try again later.', 500)
+      );
+    }
+  } catch (error) {
+    logger.error('Error in forgot password:', error);
+    next(error);
+  }
+});
+
+// @desc    Reset password
+// @route   PUT /api/v1/auth/resetpassword/:resettoken
+// @access  Public
+exports.resetPassword = asyncHandler(async (req, res, next) => {
+  try {
+    // Get hashed token
+    const resetPasswordToken = crypto
+      .createHash('sha256')
+      .update(req.params.resettoken)
+      .digest('hex');
+
+    const user = await User.findOne({
+      resetPasswordToken,
+      resetPasswordExpire: { $gt: Date.now() },
+    });
+
+    if (!user) {
+      logger.warn('Invalid or expired password reset token used');
+      return next(new AppError('Invalid or expired token', 400));
+    }
+
+    // Set new password and clear reset token
+    user.password = req.body.password;
+    user.passwordChangedAt = Date.now();
+    user.resetPasswordToken = undefined;
+    user.resetPasswordExpire = undefined;
+    
+    await user.save();
+
+    logger.info(`Password reset successful for user: ${user._id}`);
+
+    // Log the user in, send JWT
+    sendTokenResponse(user, 200, res);
+  } catch (error) {
+    logger.error('Error resetting password:', error);
+    next(error);
+  }
+});
+
+// @desc    Logout user / clear token
+// @route   POST /api/v1/auth/logout
+// @access  Private
+exports.logout = asyncHandler(async (req, res, next) => {
+  const startTime = performance.now();
+  const userId = req.user?.id;
+  const token = req.token;
+  const ip = req.ip || req.connection.remoteAddress;
+  const userAgent = req.get('user-agent') || 'unknown';
+
+  try {
+    // Log the logout action
+    logger.info('User logout request', { 
+      userId,
+      ip,
+      userAgent,
+      token: token ? 'provided' : 'none'
+    });
+
+    // Blacklist the current token if it exists
+    if (token) {
+      await Token.blacklist(token, userId);
+      logger.info('Token blacklisted', { userId, ip });
+    }
+
+    // Clear the cookies
+    res.clearCookie('token', cookieOptions);
+    res.clearCookie('refreshToken', cookieOptions);
+
+    // Log the successful logout
+    logger.info('User logged out successfully', { 
+      userId,
+      ip,
+      userAgent
+    });
+
+    // Send response
+    res.status(200).json({
+      success: true,
+      data: {},
+      message: 'Successfully logged out'
+    });
+  } catch (error) {
+    // Log the error
+    logger.error('Logout error', { 
+      error: error.message,
+      stack: error.stack,
+      userId: userId || 'unknown',
+      ip,
+      userAgent
+    });
+
+    // Even if there's an error, try to clear the cookies
+    res.clearCookie('token', cookieOptions);
+    res.clearCookie('refreshToken', cookieOptions);
+
+    // Send error response
+    next(new AppError('Error during logout', 500));
+  } finally {
+    // Log the request
+    logRequest(req, startTime);
+  }
+});
+
+// @desc    Logout user from all devices
+// @route   POST /api/v1/auth/logout-all
+// @access  Private
+exports.logoutAll = asyncHandler(async (req, res, next) => {
+  const startTime = performance.now();
+  const userId = req.user?.id;
+  const ip = req.ip || req.connection.remoteAddress;
+  const userAgent = req.get('user-agent') || 'unknown';
+
+  try {
+    // Log the logout all request
+    logger.info('Logout all devices request', { userId, ip });
+
+    // Blacklist all user's tokens
+    await Token.blacklistAllForUser(userId);
+    logger.info('All user tokens blacklisted', { userId, ip });
+
+    // Clear cookies
+    res.clearCookie('token', cookieOptions);
+    res.clearCookie('refreshToken', cookieOptions);
+
+    // Log the successful logout
+    logger.info('User logged out from all devices', { userId, ip });
+
+    // Send response
+    res.status(200).json({
+      success: true,
+      data: {},
+      message: 'Successfully logged out from all devices'
+    });
+  } catch (error) {
+    // Log the error
+    logger.error('Logout all error', { 
+      error: error.message,
+      stack: error.stack,
+      userId,
+      ip,
+      userAgent
+    });
+
+    next(new AppError('Error during logout from all devices', 500));
+  } finally {
+    // Log the request
+    logRequest(req, startTime);
+  }
+});
+
+// @desc    Refresh access token
+// @route   POST /api/v1/auth/refresh-token
+// @access  Public
+exports.refreshToken = asyncHandler(async (req, res, next) => {
+  const startTime = performance.now();
+  const { refreshToken } = req.cookies || req.body || {};
+  const ip = req.ip || req.connection.remoteAddress;
+  const userAgent = req.get('user-agent') || 'unknown';
+
+  try {
+    // 1) Check if refresh token exists
+    if (!refreshToken) {
+      logger.warn('No refresh token provided', { ip, userAgent });
+      return next(new AppError('No refresh token provided', 400));
+    }
+
+    // 2) Verify the refresh token
+    let decoded;
+    try {
+      decoded = jwt.verify(refreshToken, process.env.JWT_SECRET);
+    } catch (jwtError) {
+      logger.warn('Invalid refresh token', { 
+        error: jwtError.message, 
+        ip, 
+        userAgent 
+      });
+      return next(new AppError('Invalid refresh token', 401));
+    }
+    
+    // 3) Check if token is blacklisted
+    const isBlacklisted = await Token.isBlacklisted(refreshToken);
+    if (isBlacklisted) {
+      logger.warn('Blacklisted refresh token attempt', { 
+        userId: decoded.id, 
+        ip, 
+        userAgent 
+      });
+      return next(new AppError('Invalid refresh token', 401));
+    }
+
+    // 4) Get user from the token
+    const currentUser = await User.findById(decoded.id).select('+passwordChangedAt');
+    if (!currentUser) {
+      logger.warn('User not found for refresh token', { 
+        userId: decoded.id, 
+        ip, 
+        userAgent 
+      });
+      return next(new AppError('The user belonging to this token no longer exists', 401));
+    }
+
+    // 5) Check if user changed password after the token was issued
+    if (currentUser.changedPasswordAfter(decoded.iat)) {
+      logger.warn('Password changed after token was issued', { 
+        userId: currentUser._id, 
+        ip, 
+        userAgent 
+      });
+      return next(new AppError('User recently changed password! Please log in again', 401));
+    }
+
+    // 6) Generate new access token
+    const accessToken = signToken(currentUser._id);
+    
+    // 7) Generate new refresh token (rotate refresh token)
+    const newRefreshToken = await generateRefreshToken(currentUser._id, req);
+
+    // 8) Set cookies
+    res.cookie('token', accessToken, {
+      ...cookieOptions,
+      maxAge: TOKEN_EXPIRES_IN * 1000 // Convert to milliseconds
+    });
+    
+    res.cookie('refreshToken', newRefreshToken, {
+      ...cookieOptions,
+      maxAge: REFRESH_TOKEN_EXPIRES_IN * 1000 // Convert to milliseconds
+    });
+
+    // 9) Blacklist the old refresh token
+    await Token.blacklist(refreshToken);
+    logger.info('Refresh token rotated', { userId: currentUser._id, ip });
+
+    // 10) Prepare user data for response
+    const userData = {
+      _id: currentUser._id,
+      name: currentUser.name,
+      email: currentUser.email,
+      role: currentUser.role,
+      isVerified: currentUser.isVerified
+    };
+
+    // 11) Send response
+    res.status(200).json({
+      success: true,
+      token: accessToken,
+      refreshToken: newRefreshToken,
+      user: userData
+    });
+  } catch (error) {
+    // Log the error
+    logger.error('Refresh token error', { 
+      error: error.message,
+      stack: error.stack,
+      ip,
+      userAgent,
+      timestamp: new Date().toISOString()
+    });
+
+    // Clear invalid tokens
+    res.clearCookie('token', cookieOptions);
+    res.clearCookie('refreshToken', cookieOptions);
+
+    // Handle specific JWT errors
+    if (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError') {
+      return next(new AppError('Invalid or expired refresh token', 401));
+    }
+    
+    // For other errors
+    next(error);
+  } finally {
+    // Log the request
+    logRequest(req, startTime);
+  }
+});
+
+
+// @desc    Refresh access token
+// @route   POST /api/v1/auth/refresh-token
+// @access  Public
+exports.refreshToken = asyncHandler(async (req, res, next) => {
+  const startTime = performance.now();
+  const { refreshToken } = req.cookies || req.body || {};
+  const ip = req.ip || req.connection.remoteAddress;
+  const userAgent = req.get('user-agent') || 'unknown';
+  let currentUser;
+
+  try {
+    // 1) Check if refresh token exists
+    if (!refreshToken) {
+      return next(new AppError('No refresh token provided', 401));
+    }
+
+    // 2) Verify the refresh token
+    const decoded = jwt.verify(refreshToken, process.env.JWT_SECRET);
+    
+    // 3) Check if token is blacklisted
+    const isBlacklisted = await Token.isBlacklisted(refreshToken);
+    if (isBlacklisted) {
+      return next(new AppError('Invalid refresh token', 401));
+    }
+
+    // 4) Get user from the token
+    currentUser = await User.findById(decoded.id);
+    if (!currentUser) {
+      return next(new AppError('The user belonging to this token no longer exists', 401));
+    }
+
+    // 5) Check if user changed password after the token was issued
+    if (currentUser.changedPasswordAfter(decoded.iat)) {
+      return next(new AppError('User recently changed password! Please log in again', 401));
+    }
+
+    // 6) Generate new access token
+    const accessToken = signToken(currentUser._id);
+    
+    // 7) Generate new refresh token
+    const newRefreshToken = await generateRefreshToken(currentUser._id, req);
+
+    // 8) Blacklist the old refresh token
+    await Token.blacklist(refreshToken);
+
+    // 9) Set cookies
+    res.cookie('token', accessToken, {
+      ...cookieOptions,
+      maxAge: TOKEN_EXPIRES_IN * 1000 // Convert to milliseconds
+    });
+    
+    res.cookie('refreshToken', newRefreshToken, {
+      ...cookieOptions,
+      maxAge: REFRESH_TOKEN_EXPIRES_IN * 1000 // Convert to milliseconds
+    });
+
+    // 10) Prepare user data for response
+    const userData = {
+      _id: currentUser._id,
+      name: currentUser.name,
+      email: currentUser.email,
+      role: currentUser.role,
+      isVerified: currentUser.isVerified
+    };
+
+    // 11) Log the refresh
+    logger.info('Token refreshed successfully', { 
+      userId: currentUser._id,
+      ip,
+      userAgent: userAgent.substring(0, 100) + '...'
+    });
+
+    // 12) Send response
+    res.status(200).json({
+      success: true,
+      token: accessToken,
+      refreshToken: newRefreshToken,
+      user: userData
+    });
+  } catch (error) {
+    // Log the error
+    logger.error('Refresh token error', { 
+      error: error.message,
+      stack: error.stack,
+      userId: currentUser?._id || 'unknown',
+      ip,
+      userAgent: userAgent.substring(0, 100) + '...',
+      timestamp: new Date().toISOString()
+    });
+
+    // Clear invalid tokens
+    res.clearCookie('token', cookieOptions);
+    res.clearCookie('refreshToken', cookieOptions);
+
+    // Handle specific JWT errors
+    if (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError') {
+      return next(new AppError('Invalid or expired refresh token', 401));
+    }
+    
+    // For other errors
+    next(error);
+  } finally {
+    // Log the request
+    logRequest(req, startTime);
+  }
+});
+
+/**
+ * Sends a JWT token in both cookie and response body
+ * @param {Object} user - The user object
+ * @param {number} statusCode - HTTP status code
+ * @param {Object} res - Express response object
+ * @param {Object} [userData] - Additional user data to include in the response
+ * @param {string} [sessionId] - Session ID for tracking active sessions
+ */
+const sendTokenResponse = (user, statusCode, res, userData = null, sessionId = null) => {
+  try {
+    // Generate JWT token with additional session data
+    const token = user.getSignedJwtToken();
+    
+    // Default cookie options
+    const cookieOptions = {
+      expires: new Date(
+        Date.now() + (parseInt(process.env.JWT_COOKIE_EXPIRE) * 24 * 60 * 60 * 1000 || 30 * 24 * 60 * 60 * 1000)
+      ),
+      httpOnly: true, // Prevents client-side JS from reading the cookie
+      secure: process.env.NODE_ENV === 'production', // Only send over HTTPS in production
+      sameSite: 'strict', // Strict same-site policy
+      path: '/', // Cookie is valid for all paths
+      domain: process.env.COOKIE_DOMAIN || undefined, // Domain for production
+    };
+
+    // Add session ID to cookie if provided
+    if (sessionId) {
+      cookieOptions.signed = true; // Sign the cookie
+    }
+
+    // In production, add additional security headers
+    if (process.env.NODE_ENV === 'production') {
+      cookieOptions.secure = true; // Force HTTPS in production
+      cookieOptions.sameSite = 'lax'; // Slightly more permissive than 'strict' for cross-site requests
+      
+      // Add HSTS header for extra security
+      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
+      
+      // Add X-Content-Type-Options to prevent MIME type sniffing
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      
+      // Add X-Frame-Options to prevent clickjacking
+      res.setHeader('X-Frame-Options', 'DENY');
+      
+      // Add X-XSS-Protection
+      res.setHeader('X-XSS-Protection', '1; mode=block');
+      
+      // Add Content Security Policy
+      res.setHeader(
+        'Content-Security-Policy',
+        "default-src 'self'; " +
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net; " +
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
+        "font-src 'self' https://fonts.gstatic.com data:; " +
+        "img-src 'self' data: https:; " +
+        "connect-src 'self' https://api.studybuddy.com; "
+      );
+    }
+
+    // Prepare response data
+    const responseData = {
+      status: 'success',
+      token,
+      data: {
+        user: userData || {
+          _id: user._id,
+          name: user.name,
+          email: user.email,
+          role: user.role,
+          isVerified: user.isVerified,
+          university: user.university,
+          major: user.major,
+          year: user.year,
+          bio: user.bio,
+          lastLogin: user.lastLogin
+        }
+      }
+    };
+
+    // Add session ID to response if provided
+    if (sessionId) {
+      responseData.sessionId = sessionId;
+      
+      // Set session cookie
+      res.cookie('sessionId', sessionId, {
+        ...cookieOptions,
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'strict',
+        maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+        path: '/api/v1/auth' // Only send for auth routes
+      });
+    }
+
+    // Set JWT token in HTTP-only cookie
+    res.cookie('token', token, cookieOptions);
+    
+    // Send response
+    res.status(statusCode).json(responseData);
+    
+    // Log successful token generation
+    logger.info('Token generated and sent', { 
+      userId: user._id,
+      email: user.email.substring(0, 3) + '...',
+      statusCode,
+      sessionId: sessionId ? 'generated' : 'none'
+    });
+  } catch (error) {
+    logger.error('Error in sendTokenResponse', { 
+      error: error.message,
+      stack: error.stack,
+      userId: user?._id || 'unknown'
+    });
+    throw error; // Let the error handler middleware handle it
+  }
+};
+
+/**
+ * Sends an account locked notification email to the user
+ * @param {Object} user - The user object
+ * @param {string} ip - The IP address that triggered the lockout
+ */
+const notifyAccountLocked = async (user, ip) => {
+  try {
+    const unlockTime = new Date(user.lockUntil).toLocaleString();
+    const message = `Hello ${user.name},\n\n` +
+      `We noticed multiple failed login attempts for your account. As a security measure, your account has been temporarily locked.\n\n` +
+      `Account locked at: ${new Date().toLocaleString()}\n` +
+      `Account will be automatically unlocked at: ${unlockTime}\n` +
+      `IP Address: ${ip || 'Unknown'}\n\n` +
+      `If this was not you, please secure your account by resetting your password immediately.\n\n` +
+      `If you have any questions, please contact our support team.\n\n` +
+      `Best regards,\nThe StudyBuddy Team`;
+
+    await sendEmail({
+      email: user.email,
+      subject: 'Account Locked: Multiple Failed Login Attempts',
+      message,
+    });
+    
+    logger.info('Account locked notification sent', { 
+      userId: user._id,
+      email: user.email.substring(0, 3) + '...',
+      unlockTime 
+    });
+  } catch (error) {
+    logger.error('Failed to send account locked notification', {
+      userId: user?._id || 'unknown',
+      error: error.message,
+      stack: error.stack
+    });
+    // Don't throw error, just log it
+  }
+};
+
+/**
+ * Sends a welcome email to a newly registered user
+ * @param {Object} user - The user object
+ * @param {string} verificationToken - Email verification token
+ */
+const sendWelcomeEmail = async (user, verificationToken) => {
+  try {
+    const welcomeUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/dashboard`;
+    const message = `Welcome to StudyBuddy, ${user.name}!\n\n` +
+      `We're excited to have you on board. Here are a few things you can do to get started:\n\n` +
+      `1. Complete your profile\n` +
+      `2. Join or create a study group\n` +
+      `3. Schedule your first study session\n\n` +
+      `Get started by visiting: ${welcomeUrl}\n\n` +
+      `If you have any questions, feel free to reply to this email.\n\n` +
+      `Happy studying!\nThe StudyBuddy Team`;
+
+    await sendEmail({
+      email: user.email,
+      subject: 'Welcome to StudyBuddy!',
+      message,
+    });
+    
+    logger.info(`Welcome email sent to: ${user.email}`);
+  } catch (error) {
+    logger.error('Error sending welcome email:', error);
+    // Don't throw error, just log it
+  }
+};
