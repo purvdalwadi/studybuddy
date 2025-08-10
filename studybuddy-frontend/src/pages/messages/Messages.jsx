@@ -78,43 +78,89 @@ const processMessagesData = (data) => {
   }
 };
 
+// Helper function to normalize ID for comparison
+const normalizeId = (id) => {
+  if (!id) return null;
+  if (typeof id === 'string') return id.trim();
+  if (id._id) return id._id.toString().trim();
+  if (id.id) return id.id.toString().trim();
+  return id.toString().trim();
+};
+
+// Helper to check if user is a member of a group and get their role
+const getUserRoleInGroup = (group, userId) => {
+  if (!group?.members || !Array.isArray(group.members)) return null;
+  
+  const member = group.members.find(member => {
+    if (!member) return false;
+    
+    // Handle different member structures
+    const memberId = member.user?._id || member.user?.id || member.user || member._id || member.id;
+    return memberId && normalizeId(memberId) === normalizeId(userId);
+  });
+  
+  if (!member) return null;
+  
+  // Return the member's role or default to 'member'
+  return member.role || 'member';
+};
+
+// Helper to check if user is the creator of a group
+const isUserCreator = (group, userId) => {
+  if (!group || !userId) return false;
+  const creatorId = normalizeId(group.creator?._id || group.creator);
+  return creatorId === normalizeId(userId);
+};
+
 // Helper function to process groups data
 const processGroupsData = (data, userId) => {
-  if (!data) return [];
+  if (!data) {
+    console.log('[Messages] No groups data provided');
+    return [];
+  }
+  
   try {
     const groups = Array.isArray(data) ? data : (data.data || []);
+    console.log(`[Messages] Processing ${groups.length} groups for user ${userId}`);
     
-    // Filter groups where the current user is a member
+    // Filter groups where the current user is a member or creator
     const userGroups = groups.filter(group => {
-      // Check if group has members array and current user is a member
-      const isMember = Array.isArray(group.members) && 
-        group.members.some(member => {
-          // Handle different member object structures
-          const memberId = member?.user?._id || member?.user?.id || member?.user || member?._id || member?.id;
-          return memberId && memberId.toString() === userId?.toString();
-        });
+      if (!group) {
+        console.log('[Messages] Skipping null/undefined group');
+        return false;
+      }
       
-      // Also include groups where user is the creator
-      const isCreator = group.creator?._id?.toString() === userId?.toString() || 
-                       group.creator?.toString() === userId?.toString();
+      const groupId = group._id || group.id;
+      if (!groupId) {
+        console.log('[Messages] Group has no ID:', group);
+        return false;
+      }
+      
+      // Check if user is a member
+      const isMember = getUserRoleInGroup(group, userId) !== null;
+      
+      // Check if user is the creator
+      const isCreator = isUserCreator(group, userId);
+      
+      console.log(`[Messages] Group ${groupId} (${group.name || 'unnamed'}):`, { 
+        isMember,
+        isCreator,
+        memberCount: group.members?.length || 0
+      });
       
       return isMember || isCreator;
     });
     
-    console.log('[Messages] Filtered user groups:', {
+    console.log('[Messages] Group filtering results:', {
       totalGroups: groups.length,
-      userGroupsCount: userGroups.length,
+      filteredGroups: userGroups.length,
       userId,
-      sampleGroup: groups[0] ? {
-        _id: groups[0]._id,
-        name: groups[0].name,
-        members: groups[0].members?.map(m => ({
-          _id: m?._id,
-          user: m?.user?._id || m?.user,
-          role: m?.role
-        })),
-        creator: groups[0].creator
-      } : null
+      includedGroups: userGroups.map(g => ({
+        _id: g._id,
+        name: g.name,
+        memberCount: g.members?.length || 0,
+        isCreator: isUserCreator(g, userId)
+      }))
     });
     
     return userGroups;
@@ -307,26 +353,52 @@ export default function Messages() {
     if (!groups) return [];
     try {
       const groupsData = Array.isArray(groups) ? groups : (groups.data || []);
-      return groupsData.map(group => ({
-        ...group, // Spread the original group object first
-        // Then apply our overrides
-        id: group.id || group._id,
-        _id: group._id || group.id,
-        title: group.title || group.name,
-        name: group.name || group.title,
-        description: group.description || '',
-        members: group.members || [],
-        memberCount: group.memberCount || (group.members ? group.members.length : 0),
-        creator: group.creator,
-        createdAt: group.createdAt,
-        updatedAt: group.updatedAt,
-        isActive: group.isActive !== false
-      }));
+      const userId = user?.id || user?.data?._id;
+      
+      if (!userId) {
+        console.log('[Messages] No user ID available for group filtering');
+        return [];
+      }
+      
+      return groupsData
+        .map(group => ({
+          ...group, // Spread the original group object first
+          // Then apply our overrides
+          id: group.id || group._id,
+          _id: group._id || group.id,
+          title: group.title || group.name,
+          name: group.name || group.title,
+          description: group.description || '',
+          members: group.members || [],
+          memberCount: group.memberCount || (group.members ? group.members.length : 0),
+          creator: group.creator,
+          createdAt: group.createdAt,
+          updatedAt: group.updatedAt,
+          isActive: group.isActive !== false
+        }))
+        .filter(group => {
+          // Check if user is a member or creator of the group
+          const isMember = getUserRoleInGroup(group, userId) !== null;
+          const isCreator = isUserCreator(group, userId);
+          
+          if (isMember || isCreator) {
+            console.log(`[Messages] Including group ${group.name || group.title} (${group.id}):`, { 
+              isMember, 
+              isCreator,
+              memberCount: group.memberCount,
+              creatorId: group.creator?._id || group.creator
+            });
+            return true;
+          }
+          
+          console.log(`[Messages] Excluding group ${group.name || group.title} (${group.id}): User is not a member or creator`);
+          return false;
+        });
     } catch (error) {
       console.error('[Messages] Error processing groups data:', error);
       return [];
     }
-  }, [groups]);
+  }, [groups, user]);
   
   const activeGroup = useMemo(() => {
     if (!activeGroupId || !Array.isArray(safeGroups)) return null;
