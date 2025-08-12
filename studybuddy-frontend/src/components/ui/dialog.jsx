@@ -132,3 +132,14 @@ export function DialogTitle({ children }) {
 export function DialogFooter({ children }) {
   return <div className="mt-6 flex justify-end gap-2">{children}</div>;
 }
+
+export function DialogDescription({ children, className, ...props }) {
+  return (
+    <p 
+      className={cn("text-sm text-muted-foreground", className)}
+      {...props}
+    >
+      {children}
+    </p>
+  );
+}

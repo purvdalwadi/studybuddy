@@ -2,7 +2,75 @@ const mongoose = require('mongoose');
 const logger = require('../utils/logger');
 
 // Schema definition
+const sessionPreferencesSchema = new mongoose.Schema({
+  // Session scheduling preferences
+  preferredHours: {
+    start: {
+      type: Number,
+      min: 0,
+      max: 23,
+      default: 9 // 9 AM
+    },
+    end: {
+      type: Number,
+      min: 1,
+      max: 24,
+      default: 21 // 9 PM
+    }
+  },
+  preferWeekdays: {
+    type: Boolean,
+    default: true
+  },
+  minNoticeHours: {
+    type: Number,
+    default: 24,
+    min: 1
+  },
+  maxSessionsPerWeek: {
+    type: Number,
+    default: 5,
+    min: 1
+  },
+  defaultDuration: {
+    type: Number,
+    default: 60, // minutes
+    min: 30,
+    max: 240
+  },
+  autoApproveSessions: {
+    type: Boolean,
+    default: false
+  },
+  requireRsvp: {
+    type: Boolean,
+    default: true
+  }
+});
+
 const studyGroupSchema = new mongoose.Schema({
+  // Session Management
+  sessions: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'StudySession'
+  }],
+  sessionPreferences: {
+    type: sessionPreferencesSchema,
+    default: () => ({})
+  },
+  sessionHistory: [{
+    session: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'StudySession'
+    },
+    attendees: [{
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User'
+    }],
+    completedAt: Date,
+    averageRating: Number
+  }],
+  
   // Basic Info
   title: {
     type: String,

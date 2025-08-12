@@ -300,8 +300,9 @@ exports.updateGroup = async (req, res, next) => {
       return next(new AppError('Group not found', 404));
     }
     
-    // Handle avatar upload if present
+    // Handle avatar changes (upload or removal)
     if (req.file) {
+      // New avatar file was uploaded
       try {
         // Delete old avatar if exists
         if (group.avatarPublicId) {
@@ -326,6 +327,24 @@ exports.updateGroup = async (req, res, next) => {
       } catch (error) {
         log('Error updating group avatar', { error: error.message });
         return next(new AppError('Failed to update group avatar', 500));
+      }
+    } else if (req.body.avatar === 'null' || req.body.avatar === null) {
+      // Avatar removal requested
+      log('Avatar removal requested');
+      try {
+        // Delete old avatar from Cloudinary if exists
+        if (group.avatarPublicId) {
+          await cloudinary.deleteFile(group.avatarPublicId);
+          log('Deleted avatar from Cloudinary', { publicId: group.avatarPublicId });
+        }
+        
+        // Clear avatar fields
+        group.avatar = undefined;
+        group.avatarPublicId = undefined;
+        log('Cleared avatar fields');
+      } catch (error) {
+        log('Error removing avatar', { error: error.message });
+        // Continue even if Cloudinary deletion fails, as we still want to clear the fields
       }
     }
     

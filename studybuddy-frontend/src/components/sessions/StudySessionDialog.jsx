@@ -1,497 +1,430 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useMemo, useCallback } from 'react';
 import { useForm, Controller } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import * as z from 'zod';
-import { Dialog, DialogTrigger, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
-import { useGroups } from '@/hooks/useGroups';
+import { format, parseISO } from 'date-fns';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+  DialogDescription,
+} from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Textarea } from '@/components/ui/textarea';
-import { Badge } from '@/components/ui/badge';
 import { Label } from '@/components/ui/label';
+import { Textarea } from '@/components/ui/textarea';
 import { Switch } from '@/components/ui/switch';
-import { X, Upload, Calendar, Clock, Users, MapPin, Link as LinkIcon, FileText, Tag, Check, RefreshCw } from 'lucide-react';
-import { format } from 'date-fns';
+import { useGroups } from '@/hooks/useGroups';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Loader2, MapPin, LinkIcon, AlertCircle } from 'lucide-react';
+import { useAuth } from '@/contexts/AuthContext';
+import { useCreateSession, useUpdateSession } from '@/hooks/useSchedule';
 import { toast } from 'sonner';
-import { useAuth } from '@/contexts/authContext';  
+import { cn } from '@/lib/utils';
 
+// Session validation schema
 const sessionSchema = z.object({
-  // Required fields
-  groupId: z.string().min(1, 'Group ID is required'),
-  title: z.string()
-    .min(3, 'Title must be at least 3 characters')
-    .max(100, 'Title cannot be more than 100 characters')
-    .trim(),
-  scheduledDate: z.string().min(1, 'Scheduled date is required'),
-  scheduledTime: z.string().min(1, 'Scheduled time is required'),
-  duration: z.number()
-    .min(30, 'Minimum duration is 30 minutes')
-    .max(480, 'Maximum duration is 8 hours'),
-  
-  // Optional fields with validation
-  description: z.string()
-    .max(1000, 'Description cannot be more than 1000 characters')
-    .optional()
-    .or(z.literal('')),
-  location: z.string()
-    .max(200, 'Location cannot be more than 200 characters')
-    .optional()
-    .or(z.literal('')),
+  title: z.string().min(3, 'Title must be at least 3 characters long'),
+  description: z.string().optional(),
+  groupId: z.string().min(1, 'You must select a group'),
+  scheduledDate: z.string().min(1, 'Date is required'),
+  scheduledTime: z.string().min(1, 'Time is required'),
+  duration: z.coerce.number().min(15, 'Duration must be at least 15 minutes'),
   isOnline: z.boolean().default(false),
-  meetingLink: z.string()
-    .url('Please enter a valid URL')
-    .optional()
-    .or(z.literal('')),
-  notes: z.string()
-    .max(5000, 'Notes cannot be more than 5000 characters')
-    .optional()
-    .or(z.literal('')),
-  
-  // Status fields (managed by backend)
-  status: z.enum(['scheduled', 'ongoing', 'completed', 'cancelled']).optional(),
-  
-  // Attendees will be managed separately
-  attendees: z.array(z.any()).optional()
+  location: z.string().optional(),
+  meetingLink: z.string().url('Must be a valid URL').optional().or(z.literal(''))
+}).refine(data => data.isOnline ? !!data.meetingLink : !!data.location, {
+  message: 'Location or meeting link is required',
+  path: ['location']
 });
 
 export default function StudySessionDialog({ 
-  onSuccess, 
-  onError, 
-  open: propOpen, 
-  onOpenChange: propOnOpenChange
+  open, 
+  onOpenChange, 
+  session, 
+  onSave,
+  isLoading: externalIsLoading 
 }) {
-  const currentUser = useAuth();
-  const [internalOpen, setInternalOpen] = useState(false);
-  const [tagInput, setTagInput] = useState('');
-  const [selectedFiles, setSelectedFiles] = useState([]);
-  const [isSubmitting, setIsSubmitting] = useState(false);
+  const { user } = useAuth();
+  const isEditMode = Boolean(session);
+  const createMutation = useCreateSession();
+  const updateMutation = useUpdateSession();
+  const isLoading = externalIsLoading || createMutation.isPending || updateMutation.isPending;
+
+  const { data: groupsData, isLoading: isLoadingGroups } = useGroups();
+  
+  // Only show groups where the user is the creator (can create/edit sessions)
+  const userGroups = useMemo(() => 
+    groupsData?.filter(g => g.creator?._id === user?.data?._id) || [],
+    [groupsData, user?.data?._id]
+  );
+
+  // Set default values for create mode
+  const defaultValues = useMemo(() => ({
+    title: '',
+    description: '',
+    groupId: userGroups.length === 1 ? userGroups[0]._id : '',
+    scheduledDate: format(new Date(), 'yyyy-MM-dd'),
+    scheduledTime: format(new Date(Date.now() + 60 * 60 * 1000), 'HH:00'), // 1 hour from now
+    duration: 60, // 1 hour
+    isOnline: false,
+    location: '',
+    meetingLink: ''
+  }), [userGroups]);
+  
+  // Initialize form with useForm hook
   
   
-  // Fetch user's groups
-  const { data: groups = [], isLoading: isLoadingGroups } = useGroups({
-    onSuccess: (data) => {
-      console.log('Fetched groups:', data);
-    },
-    onError: (error) => {
-      console.error('Error fetching groups:', error);
-    }
-  });
-
-  // Debug log groups data
-  console.log('Groups state:', { groups, isLoadingGroups });
-
-  // Use propOpen if provided, otherwise use internal state
-  const open = propOpen !== undefined ? propOpen : internalOpen;
-  const setOpen = propOnOpenChange || setInternalOpen;
-
+ 
   
-  const { 
-    register, 
-    handleSubmit, 
-    control, 
-    reset, 
-    watch, 
-    setValue, 
-    formState: { errors } 
+ 
+  
+  // Initialize form with useForm hook
+  const {
+    control,
+    handleSubmit,
+    reset,
+    watch,
+    setValue,
+    register,
+    formState: { errors, isDirty }
   } = useForm({
     resolver: zodResolver(sessionSchema),
-    defaultValues: {
-      groupId: '',
-      title: '',
-      description: '',
-      scheduledDate: '',
-      scheduledTime: '',
-      duration: 60, // Default to 60 minutes
-      location: '',
-      isOnline: false,
-      meetingLink: '',
-      notes: '',
-      status: 'scheduled',
-    },
+    mode: 'onChange',
+    defaultValues: defaultValues
   });
-
+  
+  // Watch for isOnline changes to update validation
   const isOnline = watch('isOnline');
-  const tags = watch('tags') || [];
-  const sessionType = watch('sessionType');
 
-  const addTag = (e) => {
-    e.preventDefault();
-    if (tagInput.trim() && !tags.includes(tagInput) && tags.length < 5) {
-      setValue('tags', [...tags, tagInput.trim()]);
-      setTagInput('');
-    }
-  };
-
-  const removeTag = (tagToRemove) => {
-    setValue('tags', tags.filter((tag) => tag !== tagToRemove));
-  };
-
-  const handleFileChange = (e) => {
-    const files = Array.from(e.target.files);
-    if (files.length + selectedFiles.length > 5) {
-      toast.error('You can only upload up to 5 files');
-      return;
-    }
-    setSelectedFiles([...selectedFiles, ...files]);
-    setValue('resources', [...(watch('resources') || []), ...files]);
-  };
-
-  const removeFile = (index) => {
-    const newFiles = [...selectedFiles];
-    newFiles.splice(index, 1);
-    setSelectedFiles(newFiles);
-    setValue('resources', newFiles);
-  };
-
-  const onSubmit = async (data) => {
-    setIsSubmitting(true);
-    try {
-      // Format date and time for API
-      const formattedDate = new Date(data.scheduledDate);
-      const [hours, minutes] = data.scheduledTime.split(':');
-      formattedDate.setHours(parseInt(hours, 10));
-      formattedDate.setMinutes(parseInt(minutes, 10));
+  // Handle form initialization and reset when dialog opens/closes or session changes
+  useEffect(() => {
+    if (!open) return;
+    
+    if (isEditMode && session) {
+      console.log('[Debug] Initializing form with session data:', session);
       
-      const sessionData = {
+      // Parse the session data
+      const startTime = session.scheduledDate ? new Date(session.scheduledDate) : new Date();
+      const groupId = session.group?._id || session.groupId || '';
+      
+      // Prepare form values
+      const formValues = {
+        title: session.title || '',
+        description: session.description || '',
+        groupId: groupId,
+        sessionType: session.sessionType || 'discussion',
+        scheduledDate: format(startTime, 'yyyy-MM-dd'),
+        scheduledTime: format(startTime, 'HH:mm'),
+        duration: session.duration || 60,
+        maxAttendees: session.maxAttendees || '',
+        isOnline: session.isOnline || false,
+        location: session.location || '',
+        meetingLink: session.meetingLink || '',
+        tags: Array.isArray(session.tags) 
+          ? session.tags.join(', ') 
+          : (session.tags || '')
+      };
+      
+      // Log the values being set
+      console.log('[Debug] Setting form values:', formValues);
+      
+      // Reset form with the prepared values
+      reset(formValues);
+    } else {
+      // For new session, use default values
+      console.log('[Debug] Initializing new session form');
+      reset(defaultValues);
+    }
+  }, [open, isEditMode, session, reset, defaultValues]);
+  // Handle form submission
+  const onSubmit = async (data) => {
+    try {
+      if (isEditMode && session?._id) {
+        await updateMutation.mutateAsync({
+          id: session._id,
+          ...data
+        });
+      } else {
+        await createMutation.mutateAsync(data);
+      }
+      
+      // Close the dialog on success
+      onOpenChange(false);
+      
+      // Show success message
+      toast.success(`Session ${isEditMode ? 'updated' : 'created'} successfully!`);
+      
+    } catch (error) {
+      // Error handling is done in the mutation hooks
+      console.error('Error submitting form:', error);
+    }
+  };
+
+  
+  // Handle dialog close - moved after form initialization
+  const handleOpenChange = useCallback((isOpen) => {
+    if (!isOpen) {
+      // Reset form when closing
+      reset();
+    }
+    onOpenChange(isOpen);
+  }, [onOpenChange, reset]);
+
+  // Remove duplicate form declaration - using the one at the top of the component
+
+  useEffect(() => {
+    if (open) {
+      if (isEditMode && session) {
+        console.log('[Debug] Session data for edit:', session);
+        const scheduledDateTime = new Date(session.scheduledDate);
+        
+        // Get the group ID, handling both populated group object and direct ID
+        const groupId = session.group?._id || session.groupId || '';
+        
+        console.log('[Debug] Setting form values for edit mode. Group ID:', groupId);
+        console.log('[Debug] Available user groups:', userGroups);
+        
+        // Ensure the group exists in user's groups
+        const groupExists = userGroups.some(g => g._id === groupId);
+        
+        if (!groupExists && userGroups.length > 0) {
+          console.warn(`[Debug] Group ${groupId} not found in user's groups. Falling back to first available group.`);
+        }
+        
+        const defaultGroupId = groupExists ? groupId : (userGroups[0]?._id || '');
+        
+        const formValues = {
+          title: session.title || '',
+          description: session.description || '',
+          groupId: defaultGroupId,
+          scheduledDate: format(scheduledDateTime, 'yyyy-MM-dd'),
+          scheduledTime: format(scheduledDateTime, 'HH:mm'),
+          duration: session.duration || 60,
+          isOnline: session.isOnline || false,
+          location: session.location || '',
+          meetingLink: session.meetingLink || ''
+        };
+        
+        console.log('[Debug] Resetting form with values:', formValues);
+        reset(formValues);
+      } else {
+        // For new sessions, set default group if user has only one group
+        const defaultGroupId = (!isLoadingGroups && userGroups.length === 1) ? userGroups[0]._id : '';
+        reset({
+          title: '',
+          description: '',
+          groupId: defaultGroupId,
+          scheduledDate: format(new Date(), 'yyyy-MM-dd'),
+          scheduledTime: format(new Date(Date.now() + 60 * 60 * 1000), 'HH:00'),
+          duration: 60,
+          isOnline: false,
+          location: '',
+          meetingLink: ''
+        });
+      }
+    }
+  }, [session, isEditMode, open, reset, userGroups, isLoadingGroups]);
+
+  const handleFormSubmit = (data) => {
+    console.log('[Debug] Form data on submit:', data);
+
+    try {
+      // Format the date and time properly
+      const dateStr = new Date(data.scheduledDate).toISOString().split('T')[0];
+      const timeStr = data.scheduledTime;
+      
+      // Create date objects for time calculations
+      const startTime = new Date(`${dateStr}T${timeStr}`);
+      
+      // Validate the date
+      if (isNaN(startTime.getTime())) {
+        throw new Error('Invalid date or time format');
+      }
+      
+      const endTime = new Date(startTime.getTime() + (Number(data.duration) * 60000));
+
+      // Prepare the data object with all required fields
+      const processedData = {
+        title: data.title,
+        description: data.description,
         groupId: data.groupId,
-        title: data.title.trim(),
-        description: data.description?.trim() || undefined,
-        scheduledDate: formattedDate.toISOString(),
+        scheduledDate: startTime.toISOString(),
+        startTime: startTime.toISOString(), // Add startTime in ISO format
+        endTime: endTime.toISOString(),     // Add endTime in ISO format
         duration: Number(data.duration),
         isOnline: data.isOnline,
-        meetingLink: data.isOnline ? data.meetingLink?.trim() : undefined,
-        location: !data.isOnline ? data.location?.trim() : undefined,
-        notes: data.notes?.trim() || undefined,
-        status: 'scheduled',
+        ...(data.isOnline 
+          ? { meetingLink: data.meetingLink }
+          : { location: data.location }
+        )
       };
 
-      // Call the API
-      const response = await fetch('/api/study-sessions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${localStorage.getItem('accessToken')}`,
-        },
-        body: JSON.stringify(sessionData),
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.message || 'Failed to create session');
-      }
-
-      const result = await response.json();
+      console.log('[Debug] Processed data for save:', processedData);
       
-      // Reset form and close dialog
-      reset();
-      setSelectedFiles([]);
-      setOpen(false);
-      
-      // Call success callback
-      if (onSuccess) onSuccess(result);
-      
-      toast.success('Your study session has been scheduled successfully');
+      onSave(processedData);
     } catch (error) {
-      console.error('Error creating session:', error);
-      
-      // Call error callback if provided
-      if (onError) onError(error);
-      
-      toast.error(error.message || 'Failed to create session');
+      console.error('Error processing form data:', error);
+      // Show error to user
+      toast.error('Error processing form data. Please try again.');
     }
   };
 
+  const handleCancel = () => {
+    if (onOpenChange) {
+      onOpenChange(false);
+    }
+  }
+
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+    <Dialog 
+      open={!!open} 
+      onOpenChange={(isOpen) => {
+        if (onOpenChange) {
+          onOpenChange(isOpen);
+        } else if (!isOpen) {
+          // If onOpenChange is not provided, we still need to handle closing
+          // This is a fallback for when parent component manages the state differently
+          handleCancel();
+        }
+      }}
+    >
+      <DialogContent className="sm:max-w-[500px]">
         <DialogHeader>
-          <h2 className="text-2xl font-bold text-primary-700 dark:text-primary-200">Schedule New Study Session</h2>
-          <p className="text-sm text-gray-500">Fill in the details below to create a new study session</p>
+          <DialogTitle>{isEditMode ? 'Edit Session' : 'Create a New Session'}</DialogTitle>
         </DialogHeader>
-        
-        <form onSubmit={handleSubmit(onSubmit)} className="space-y-5">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                  Group <span className="text-red-500">*</span>
-                </label>
-                <Controller
-                  name="groupId"
-                  control={control}
-                  render={({ field }) => (
-                    <Select 
-                      onValueChange={field.onChange} 
-                      value={field.value}
-                      required
-                    >
-                      <SelectTrigger className="w-full text-gray-900 dark:text-white">
-                        <SelectValue placeholder="Select a group" className="text-gray-900 dark:text-white" />
-                      </SelectTrigger>
-                      <SelectContent className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-md shadow-lg">
-                        {isLoadingGroups ? (
-                          <div className="p-2 text-sm text-gray-900 dark:text-white">Loading groups...</div>
-                        ) : groups.length === 0 ? (
-                          <div className="p-2 text-sm text-gray-900 dark:text-white">No groups found. Create a group first.</div>
-                        ) : (
-                          groups.map((group) => (
-                            (group?.creator?.id === currentUser._id) && <SelectItem 
-                              key={group._id} 
-                              value={group._id}
-                              className="text-gray-900 dark:text-white hover:bg-gray-100 dark:hover:bg-gray-700"
-                            >
-                              {group.title}
-                            </SelectItem>
-                          ))
-                        )}
-                      </SelectContent>
-                    </Select>
-                  )}
-                />
-                {errors.groupId?.message && (
-                  <p className="mt-1 text-sm text-red-600">{errors.groupId.message}</p>
-                )}
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                  Title <span className="text-red-500">*</span>
-                </label>
-                <Input 
-                  placeholder="E.g., Calculus Study Session" 
-                  {...register("title")} 
-                  error={errors.title?.message} 
-                  required 
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                  Date <span className="text-red-500">*</span>
-                </label>
-                <div className="flex items-center gap-2">
-                  <Calendar className="h-5 w-5 text-gray-400" />
-                  <Input 
-                    type="date" 
-                    {...register("scheduledDate")} 
-                    error={errors.scheduledDate?.message} 
-                    required 
-                    className="flex-1"
-                    min={new Date().toISOString().split('T')[0]}
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                  Time <span className="text-red-500">*</span>
-                </label>
-                <div className="flex items-center gap-2">
-                  <Clock className="h-5 w-5 text-gray-400" />
-                  <Input 
-                    type="time" 
-                    {...register("scheduledTime")} 
-                    error={errors.scheduledTime?.message} 
-                    required 
-                    className="flex-1"
-                    step="300" // 5 minute intervals
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                  Duration (minutes) <span className="text-red-500">*</span>
-                </label>
-                <div className="flex items-center gap-2">
-                  <Clock className="h-5 w-5 text-gray-400" />
-                  <Input 
-                    type="number" 
-                    min={15} 
-                    max={480} 
-                    step={15}
-                    {...register("duration", { valueAsNumber: true })} 
-                    error={errors.duration?.message} 
-                    required 
-                    className="flex-1"
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                  Notes
-                </label>
-                <Textarea
-                  placeholder="Any additional details about this session..."
-                  rows={3}
-                  {...register("notes")}
-                  error={errors.notes?.message}
-                />
-              </div>
-            </div>
-
-            <div className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                  Description
-                </label>
-                <Textarea
-                  placeholder="What will this session cover?"
-                  rows={4}
-                  {...register("description")}
-                  error={errors.description?.message}
-                />
-              </div>
-
-              <div>
-                <div className="flex items-center gap-2 mb-2">
-                  <input
-                    type="checkbox"
-                    id="isOnline"
-                    {...register("isOnline")}
-                    className="h-4 w-4 rounded border-gray-300 text-primary-600 focus:ring-primary-500"
-                  />
-                  <label htmlFor="isOnline" className="text-sm font-medium text-gray-700 dark:text-gray-300">
-                    This is an online session
-                  </label>
-                </div>
-                {isOnline && (
-                  <div className="mt-2">
-                    <div className="flex items-center gap-2 mb-1">
-                      <LinkIcon className="h-5 w-5 text-gray-400" />
-                      <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
-                        Meeting Link
-                      </label>
-                    </div>
-                    <Input
-                      placeholder="https://meet.google.com/..."
-                      {...register("meetingLink")}
-                      error={errors.meetingLink?.message}
-                    />
-                  </div>
-                )}
-                {isOnline ? (
-                  <div className="mt-2">
-                    <div className="flex items-center gap-2 mb-1">
-                      <LinkIcon className="h-5 w-5 text-gray-400" />
-                      <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
-                        Meeting Link <span className="text-red-500">*</span>
-                      </label>
-                    </div>
-                    <Input
-                      placeholder="https://meet.google.com/..."
-                      {...register("meetingLink")}
-                      error={errors.meetingLink?.message}
-                      required
-                    />
-                  </div>
-                ) : (
-                  <div className="mt-2">
-                    <div className="flex items-center gap-2 mb-1">
-                      <MapPin className="h-5 w-5 text-gray-400" />
-                      <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
-                        Location <span className="text-red-500">*</span>
-                      </label>
-                    </div>
-                    <Input
-                      placeholder="E.g., Library Room 302"
-                      {...register("location")}
-                      error={errors.location?.message}
-                      required
-                    />
-                  </div>
-                )}
-              </div>
-
-              <div>
-                <div className="flex items-center gap-2 mb-2">
-                  <MapPin className="h-5 w-5 text-gray-400" />
-                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
-                    Location {!isOnline && <span className="text-red-500">*</span>}
-                  </label>
-                </div>
-                <Input
-                  placeholder="E.g., Library Room 302"
-                  {...register("location")}
-                  error={errors.location?.message}
-                  required={!isOnline}
-                />
-              </div>
-
-              <div>
-                <div className="flex items-center gap-2 mb-2">
-                  <FileText className="h-5 w-5 text-gray-400" />
-                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
-                    Resources (Optional)
-                  </label>
-                </div>
-                <div className="space-y-2">
-                  <input
-                    type="file"
-                    id="resources"
-                    multiple
-                    onChange={handleFileChange}
-                    className="hidden"
-                  />
-                  <label
-                    htmlFor="resources"
-                    className="flex items-center justify-center w-full px-4 py-2 text-sm border border-dashed rounded-md cursor-pointer border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
+        <form onSubmit={handleSubmit(handleFormSubmit)} className="grid gap-6 py-4">
+          
+          <div className="grid gap-2">
+            <Label htmlFor="group">Group</Label>
+            <Controller
+              name="groupId"
+              control={control}
+              render={({ field: { onChange, value } }) => {
+                // Log the current value and available groups for debugging
+                console.log('[Debug] Group Select - Current value:', value, 'Available groups:', userGroups);
+                
+                // Ensure the value is a string for comparison
+                const selectedValue = value ? value.toString() : '';
+                
+                return (
+                  <Select 
+                    onValueChange={onChange} 
+                    value={selectedValue}
+                    disabled={isLoadingGroups || userGroups.length === 0}
                   >
-                    <Upload className="w-4 h-4 mr-2" />
-                    {selectedFiles.length > 0
-                      ? `Add more files (${selectedFiles.length}/5)`
-                      : "Upload files (max 5)"}
-                  </label>
-                  {selectedFiles.length > 0 && (
-                    <div className="space-y-1">
-                      {selectedFiles.map((file, index) => (
-                        <div key={index} className="flex items-center justify-between p-2 text-sm bg-gray-50 dark:bg-gray-800 rounded">
-                          <span className="truncate max-w-[200px]">{file.name}</span>
-                          <button
-                            type="button"
-                            onClick={() => removeFile(index)}
-                            className="text-red-500 hover:text-red-700"
+                    <SelectTrigger id="group">
+                      <SelectValue 
+                        placeholder={
+                          isLoadingGroups 
+                            ? 'Loading groups...' 
+                            : userGroups.length === 0 
+                              ? 'No groups available' 
+                              : 'Select a group'
+                        } 
+                      />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {userGroups.map((group) => {
+                        const groupIdStr = group._id.toString();
+                        return (
+                          <SelectItem 
+                            key={groupIdStr} 
+                            value={groupIdStr}
                           >
-                            <X className="h-4 w-4" />
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </div>
+                            {group.title}
+                          </SelectItem>
+                        );
+                      })}
+                    </SelectContent>
+                  </Select>
+                );
+              }}
+            />
+            {errors.groupId && <p className="text-red-500 text-xs mt-1">{errors.groupId.message}</p>}
+            {userGroups.length === 0 && !isLoadingGroups && (
+              <p className="text-xs text-orange-500 mt-1">You need to create a group first before creating a session.</p>
+            )}
+          </div>
+
+          <div className="grid gap-2">
+            <Label htmlFor="title">Title</Label>
+            <Input id="title" {...register('title')} />
+            {errors.title && <p className="text-red-500 text-xs mt-1">{errors.title.message}</p>}
+          </div>
+
+          <div className="grid gap-2">
+            <Label htmlFor="description">Description</Label>
+            <Textarea id="description" {...register('description')} placeholder="What will this session cover?" />
+          </div>
+
+
+
+
+
+          <div className="grid grid-cols-2 gap-4">
+            <div className="grid gap-2">
+              <Label htmlFor="scheduledDate">Date</Label>
+              <Input id="scheduledDate" type="date" {...register('scheduledDate')} />
+              {errors.scheduledDate && <p className="text-red-500 text-xs mt-1">{errors.scheduledDate.message}</p>}
+            </div>
+            <div className="grid gap-2">
+              <Label htmlFor="scheduledTime">Time</Label>
+              <Input id="scheduledTime" type="time" {...register('scheduledTime')} />
+              {errors.scheduledTime && <p className="text-red-500 text-xs mt-1">{errors.scheduledTime.message}</p>}
             </div>
           </div>
 
-          <DialogFooter className="mt-6">
-            <Button 
-              type="submit" 
-              variant="primary"
-              disabled={isSubmitting}
-              className="gap-2"
-            >
-              {isSubmitting ? (
-                <>
-                  <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                  </svg>
-                  Creating...
-                </>
-              ) : 'Create Session'}
-            </Button>
-            <Button 
-              type="button" 
-              variant="outline" 
-              onClick={() => { setOpen(false); reset(); }}
-              disabled={isSubmitting}
-            >
+          <div className="grid gap-2">
+            <Label htmlFor="duration">Duration (minutes)</Label>
+            <Input 
+              id="duration" 
+              type="number" 
+              min="15"
+              step="15"
+              {...register('duration')} 
+            />
+            {errors.duration && <p className="text-red-500 text-xs mt-1">{errors.duration.message}</p>}
+          </div>
+
+          <div className="flex items-center space-x-2">
+            <input
+              type="checkbox"
+              id="isOnline"
+              {...register('isOnline')}
+              className="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+            />
+            <Label htmlFor="isOnline">Online Session</Label>
+          </div>
+
+          {isOnline ? (
+            <div className="grid gap-2">
+              <Label htmlFor="meetingLink" className="flex items-center"><LinkIcon className="h-4 w-4 mr-2"/>Meeting Link</Label>
+              <Input id="meetingLink" {...register('meetingLink')} placeholder="https://zoom.us/..." />
+              {errors.meetingLink && <p className="text-red-500 text-xs mt-1">{errors.meetingLink.message}</p>}
+            </div>
+          ) : (
+            <div className="grid gap-2">
+              <Label htmlFor="location" className="flex items-center"><MapPin className="h-4 w-4 mr-2"/>Location</Label>
+              <Input id="location" {...register('location')} placeholder="e.g., Library Room 401" />
+              {errors.location && <p className="text-red-500 text-xs mt-1">{errors.location.message}</p>}
+            </div>
+          )}
+          
+          <DialogFooter className="pt-4 border-t">
+            <Button type="button" variant="outline" onClick={handleCancel} disabled={isLoading}>
               Cancel
             </Button>
+            <Button type="submit" disabled={isLoading}>
+              {isLoading ? (
+                <><Loader2 className="mr-2 h-4 w-4 animate-spin" /> {isEditMode ? 'Saving...' : 'Creating...'}</>
+              ) : (
+                isEditMode ? 'Save Changes' : 'Create Session'
+              )}
+            </Button>
           </DialogFooter>
-          
         </form>
       </DialogContent>
     </Dialog>

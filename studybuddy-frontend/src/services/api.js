@@ -7,6 +7,25 @@ export const api = axios.create({
   baseURL: API_BASE_URL,
   withCredentials: true,
   headers: { "Content-Type": "application/json" },
+  timeout: 10000, // 10 seconds
+});
+
+// Track last request time to prevent rate limiting
+let lastRequestTime = 0;
+const REQUEST_DELAY = 300; // 300ms between requests
+
+// Add request interceptor for rate limiting
+api.interceptors.request.use(async (config) => {
+  const now = Date.now();
+  const timeSinceLastRequest = now - lastRequestTime;
+  
+  // If less than REQUEST_DELAY ms has passed since last request, delay this request
+  if (timeSinceLastRequest < REQUEST_DELAY) {
+    await new Promise(resolve => setTimeout(resolve, REQUEST_DELAY - timeSinceLastRequest));
+  }
+  
+  lastRequestTime = Date.now();
+  return config;
 });
 
 // Attach Authorization header with JWT from localStorage if present
@@ -51,6 +70,19 @@ api.interceptors.response.use(
       url: error.config?.url,
       response: error.response?.data
     });
+    
+    // Handle rate limiting
+    if (error.response?.status === 429) {
+      const retryAfter = error.response?.headers?.['retry-after'] || 5;
+      console.warn(`[API] Rate limited. Retrying after ${retryAfter} seconds...`);
+      
+      // Return a promise that will retry the request after the delay
+      return new Promise((resolve) => {
+        setTimeout(() => {
+          resolve(api(error.config));
+        }, retryAfter * 1000);
+      });
+    }
     
     if (error.response?.status === 401) {
       console.log('[API] 401 Unauthorized - Invalid or expired token');
@@ -367,8 +399,12 @@ export const getMessageReadReceipts = (messageId) => {
  * @returns {Promise<{data: Session[]}>}
  */
 export const fetchSessions = (params = {}) => {
-  console.log('[API] Fetching study sessions', { params });
-  return api.get('/study-sessions', { params });
+  console.log('[API] Fetching all sessions with params:', params);
+  const populatedParams = {
+    ...params,
+    populate: 'createdBy,attendees.user,group',
+  };
+  return api.get('/study-sessions', { params: populatedParams });
 };
 
 /**
@@ -379,7 +415,8 @@ export const fetchSessions = (params = {}) => {
  */
 export const fetchGroupSessions = (groupId, params = {}) => {
   console.log(`[API] Fetching sessions for group ${groupId}`, { params });
-  return api.get(`/study-sessions/group/${groupId}`, { params });
+  const populatedParams = { ...params, populate: 'createdBy,attendees.user,group' };
+  return api.get(`/study-sessions/groups/${groupId}`, { params: populatedParams });
 };
 
 /**
@@ -389,7 +426,7 @@ export const fetchGroupSessions = (groupId, params = {}) => {
  */
 export const fetchSession = (id) => {
   console.log(`[API] Fetching session ${id}`);
-  return api.get(`/study-sessions/${id}`);
+  return api.get(`/study-sessions/${id}`, { params: { populate: 'createdBy,attendees.user,group' } });
 };
 
 /**
@@ -399,20 +436,22 @@ export const fetchSession = (id) => {
  */
 export const getUpcomingSessions = (params = {}) => {
   console.log('[API] Fetching upcoming sessions', { params });
-  return api.get('/study-sessions/upcoming', { params });
+  const populatedParams = { ...params, populate: 'createdBy,attendees.user,group' };
+  return api.get('/study-sessions/upcoming', { params: populatedParams });
 };
 
 /**
- * Fetch sessions within a date range
- * @param {string} start - Start date (ISO string)
- * @param {string} end - End date (ISO string)
  * @param {Object} [params] - Additional query parameters
  * @returns {Promise<{data: Session[]}>}
  */
 export const fetchSessionsByDateRange = (start, end, params = {}) => {
   console.log(`[API] Fetching sessions from ${start} to ${end}`, { params });
   return api.get('/study-sessions/range', { 
-    params: { ...params, start, end } 
+    params: { 
+      ...params, 
+      startDate: start,
+      endDate: end 
+    } 
   });
 };
 
@@ -422,7 +461,7 @@ export const fetchSessionsByDateRange = (start, end, params = {}) => {
  * @param {string} data.groupId - ID of the group
  * @param {string} data.title - Session title
  * @param {string} [data.description] - Session description
- * @param {'lecture'|'discussion'|'qna'|'workshop'|'review'|'other'} [data.sessionType='discussion'] - Type of session
+ * @param {'lecture'|'discussion'|'qna'|'workshop'|'review'|'other'} [data.sessionType] - Type of session
  * @param {string} data.scheduledDate - ISO date string
  * @param {number} data.duration - Duration in minutes
  * @param {string} [data.location] - Physical location (if applicable)
@@ -461,7 +500,9 @@ export const createSession = (data) => {
     });
   }
   
-  return api.post(`/study-sessions/groups/${data.groupId}`, data);
+  // Remove the groupId from the data object before sending
+  const { groupId, ...sessionData } = data;
+  return api.post(`/study-sessions/groups/${groupId}`, sessionData);
 };
 
 /**
